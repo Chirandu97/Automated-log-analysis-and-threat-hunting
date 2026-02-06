@@ -1,0 +1,686 @@
+#!/usr/bin/env python3
+"""
+Automated Log Analysis & Threat Hunting Script
+Analyzes web server logs, detects threats, generates alerts and reports.
+Author: CyberSecurity Engineer
+Version: 1.0.0
+"""
+
+import re
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+import matplotlib.pyplot as plt
+import seaborn as sns
+import smtplib
+import logging
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+import requests
+import json
+import os
+from dotenv import load_dotenv
+from sklearn.ensemble import IsolationForest
+from collections import defaultdict, Counter
+import argparse
+
+# Load environment variables
+load_dotenv()
+
+# Configuration - adjust via environment variables or .env file
+LOG_FILE_PATH = os.getenv('LOG_FILE_PATH', 'access.log')
+ALERT_EMAIL = os.getenv('ALERT_EMAIL', '')
+EMAIL_PASSWORD = os.getenv('EMAIL_PASSWORD', '')
+SMTP_SERVER = os.getenv('SMTP_SERVER', 'smtp.gmail.com')
+SMTP_PORT = int(os.getenv('SMTP_PORT', 587))
+SLACK_WEBHOOK_URL = os.getenv('SLACK_WEBHOOK_URL', '')
+BRUTEFORCE_THRESHOLD = int(os.getenv('BRUTEFORCE_THRESHOLD', 50))
+BRUTEFORCE_WINDOW_MINUTES = int(os.getenv('BRUTEFORCE_WINDOW_MINUTES', 5))
+ANOMALY_CONTAMINATION = float(os.getenv('ANOMALY_CONTAMINATION', 0.1))
+REPORT_PATH = os.getenv('REPORT_PATH', 'threat_report.html')
+CHUNK_SIZE = 100000  # For large log files
+
+# Threat patterns (regex)
+THREAT_PATTERNS = {
+    'sql_injection': [
+        r"(\%27)|(\')|(\-\-)|(\%23)|(#)",  # SQL meta-characters
+        r"\w*((\%27)|(\'))((\%6F)|o|(\%4F))((\%72)|r|(\%52))",  # 'or'
+        r"((\%27)|(\'))union",  # 'union
+        r"exec(\s|\+)+(s|x)p\w+",  # exec procedures
+        r"/(\%3D|=)[^\n]*(\%27|'|--|%23|#)/i",  # SQL operators
+    ],
+    'xss': [
+        r"<script.*?>.*?</script>",  # basic script tags
+        r"javascript:",  # javascript protocol
+        r"onerror\s*=",  # event handlers
+        r"alert\(.*?\)",  # alert calls
+        r"<iframe.*?>.*?</iframe>",  # iframe tags
+    ],
+    'path_traversal': [
+        r"\.\./",  # directory traversal
+        r"\.\.\\",  # Windows directory traversal
+        r"etc/passwd",  # sensitive file access
+        r"win\.ini",  # Windows config
+    ],
+    'command_injection': [
+        r";\s*(bash|sh|cmd|powershell)\s*",  # command separators
+        r"\|\s*(bash|sh|cmd|powershell)\s*",  # pipe commands
+        r"&\s*(bash|sh|cmd|powershell)\s*",  # background processes
+        r"\$\("  # command substitution
+    ]
+}
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('threat_hunter.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+def parse_log_line(line):
+    """
+    Parse a single Apache common log format line.
+    Format: %h %l %u %t \"%r\" %>s %b
+    Returns dict or None for malformed lines.
+    """
+    pattern = r'^(\S+) (\S+) (\S+) \[(.*?)\] "(.*?)" (\d{3}) (\S+)$'
+    match = re.match(pattern, line)
+    if not match:
+        return None
+    
+    try:
+        ip, identity, user, timestamp, request, status, size = match.groups()
+        # Parse request into method, path, protocol
+        request_parts = request.split()
+        if len(request_parts) == 3:
+            method, path, protocol = request_parts
+        else:
+            method, path, protocol = 'UNKNOWN', request, 'UNKNOWN'
+        
+        # Convert timestamp
+        dt = datetime.strptime(timestamp, '%d/%b/%Y:%H:%M:%S %z')
+        
+        return {
+            'ip': ip,
+            'timestamp': dt,
+            'method': method,
+            'path': path,
+            'protocol': protocol,
+            'status': int(status),
+            'size': 0 if size == '-' else int(size),
+            'user_agent': 'Unknown',  # Not in common format
+            'raw': line.strip()
+        }
+    except Exception as e:
+        logger.warning(f"Failed to parse line: {line[:100]}... Error: {e}")
+        return None
+
+def parse_logs(file_path):
+    """
+    Parse log file into pandas DataFrame.
+    Handles large files by reading in chunks.
+    """
+    log_entries = []
+    try:
+        with open(file_path, 'r') as f:
+            for i, line in enumerate(f):
+                entry = parse_log_line(line)
+                if entry:
+                    log_entries.append(entry)
+                
+                # Periodic logging for large files
+                if i > 0 and i % 10000 == 0:
+                    logger.info(f"Parsed {i} lines...")
+        
+        df = pd.DataFrame(log_entries)
+        if df.empty:
+            logger.warning("No valid log entries found.")
+            return df
+        
+        logger.info(f"Successfully parsed {len(df)} log entries.")
+        return df
+    except FileNotFoundError:
+        logger.error(f"Log file not found: {file_path}")
+        raise
+    except Exception as e:
+        logger.error(f"Error parsing logs: {e}")
+        raise
+
+def detect_sqli_xss(df):
+    """
+    Detect SQL injection and XSS attempts using regex patterns.
+    Returns DataFrame with threat matches.
+    """
+    threats = []
+    
+    for idx, row in df.iterrows():
+        path = row['path']
+        ip = row['ip']
+        timestamp = row['timestamp']
+        method = row['method']
+        
+        for threat_type, patterns in THREAT_PATTERNS.items():
+            for pattern in patterns:
+                if re.search(pattern, path, re.IGNORECASE):
+                    threats.append({
+                        'timestamp': timestamp,
+                        'ip': ip,
+                        'threat_type': threat_type,
+                        'method': method,
+                        'path': path,
+                        'pattern': pattern,
+                        'severity': 'HIGH' if threat_type in ['sql_injection', 'command_injection'] else 'MEDIUM'
+                    })
+                    break  # Only record first match per threat type
+    
+    threats_df = pd.DataFrame(threats) if threats else pd.DataFrame(
+        columns=['timestamp', 'ip', 'threat_type', 'method', 'path', 'pattern', 'severity']
+    )
+    return threats_df
+
+def detect_bruteforce(df, threshold=BRUTEFORCE_THRESHOLD, window_minutes=BRUTEFORCE_WINDOW_MINUTES):
+    """
+    Detect potential brute force attacks by IP frequency in time windows.
+    """
+    if df.empty:
+        return pd.DataFrame()
+    
+    df_sorted = df.sort_values('timestamp')
+    brute_force_suspects = []
+    ip_windows = defaultdict(list)
+    
+    for _, row in df_sorted.iterrows():
+        ip = row['ip']
+        ts = row['timestamp']
+        
+        # Clean old entries outside window
+        ip_windows[ip] = [t for t in ip_windows[ip] 
+                         if ts - t <= timedelta(minutes=window_minutes)]
+        
+        ip_windows[ip].append(ts)
+        
+        # Check threshold
+        if len(ip_windows[ip]) >= threshold:
+            brute_force_suspects.append({
+                'ip': ip,
+                'request_count': len(ip_windows[ip]),
+                'window_minutes': window_minutes,
+                'first_seen': min(ip_windows[ip]),
+                'last_seen': max(ip_windows[ip]),
+                'severity': 'HIGH'
+            })
+            # Reset after detection to avoid duplicate alerts
+            ip_windows[ip] = []
+    
+    return pd.DataFrame(brute_force_suspects) if brute_force_suspects else pd.DataFrame()
+
+def detect_anomalous_ips(df, contamination=ANOMALY_CONTAMINATION):
+    """
+    Use Isolation Forest to detect anomalous IPs based on request patterns.
+    Features: request count, unique paths, error rate, avg time between requests.
+    """
+    if df.empty or len(df['ip'].unique()) < 10:  # Need enough IPs
+        logger.info("Not enough unique IPs for anomaly detection.")
+        return pd.DataFrame()
+    
+    # Aggregate by IP
+    ip_stats = []
+    for ip, group in df.groupby('ip'):
+        request_count = len(group)
+        unique_paths = group['path'].nunique()
+        error_rate = (group['status'] >= 400).sum() / request_count
+        time_diffs = group['timestamp'].diff().dropna()
+        avg_time_between = time_diffs.mean().total_seconds() if not time_diffs.empty else 0
+        
+        ip_stats.append({
+            'ip': ip,
+            'request_count': request_count,
+            'unique_paths': unique_paths,
+            'error_rate': error_rate,
+            'avg_time_between': avg_time_between
+        })
+    
+    stats_df = pd.DataFrame(ip_stats)
+    
+    # Prepare features for ML
+    features = ['request_count', 'unique_paths', 'error_rate', 'avg_time_between']
+    X = stats_df[features].fillna(0)
+    
+    # Normalize
+    X_normalized = (X - X.mean()) / (X.std() + 1e-8)
+    
+    # Train Isolation Forest
+    iso_forest = IsolationForest(
+        contamination=contamination,
+        random_state=42,
+        n_estimators=100
+    )
+    
+    predictions = iso_forest.fit_predict(X_normalized)
+    stats_df['anomaly_score'] = iso_forest.decision_function(X_normalized)
+    stats_df['is_anomaly'] = predictions == -1
+    
+    # Return anomalous IPs
+    anomalous = stats_df[stats_df['is_anomaly']].copy()
+    anomalous['severity'] = 'MEDIUM'
+    anomalous['threat_type'] = 'anomalous_behavior'
+    
+    return anomalous[['ip', 'threat_type', 'request_count', 'unique_paths', 
+                      'error_rate', 'anomaly_score', 'severity']]
+
+def generate_visualizations(threats_df, brute_df, anomaly_df, report_path):
+    """
+    Generate visualization charts for the report.
+    """
+    if threats_df.empty and brute_df.empty and anomaly_df.empty:
+        logger.info("No threats detected, skipping visualizations.")
+        return
+    
+    sns.set_style("whitegrid")
+    fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+    axes = axes.ravel()
+    
+    # Plot 1: Threat types distribution
+    if not threats_df.empty:
+        threat_counts = threats_df['threat_type'].value_counts()
+        axes[0].bar(threat_counts.index, threat_counts.values)
+        axes[0].set_title('Threat Types Distribution')
+        axes[0].set_xlabel('Threat Type')
+        axes[0].set_ylabel('Count')
+        axes[0].tick_params(axis='x', rotation=45)
+    
+    # Plot 2: Top malicious IPs
+    all_ips = []
+    if not threats_df.empty:
+        all_ips.extend(threats_df['ip'].tolist())
+    if not brute_df.empty:
+        all_ips.extend(brute_df['ip'].tolist())
+    
+    if all_ips:
+        ip_counts = Counter(all_ips).most_common(10)
+        ips, counts = zip(*ip_counts) if ip_counts else ([], [])
+        axes[1].bar(ips, counts)
+        axes[1].set_title('Top 10 Malicious IPs')
+        axes[1].set_xlabel('IP Address')
+        axes[1].set_ylabel('Threat Count')
+        axes[1].tick_params(axis='x', rotation=45)
+    
+    # Plot 3: Brute force IPs vs request count
+    if not brute_df.empty:
+        axes[2].bar(brute_df['ip'], brute_df['request_count'])
+        axes[2].set_title('Brute Force Attempts (Requests Count)')
+        axes[2].set_xlabel('IP Address')
+        axes[2].set_ylabel('Requests in Window')
+        axes[2].tick_params(axis='x', rotation=45)
+    
+    # Plot 4: Anomaly scores
+    if not anomaly_df.empty:
+        axes[3].scatter(anomaly_df['ip'], anomaly_df['anomaly_score'], alpha=0.6)
+        axes[3].axhline(y=0, color='r', linestyle='--', alpha=0.3)
+        axes[3].set_title('Anomaly Scores by IP')
+        axes[3].set_xlabel('IP Address')
+        axes[3].set_ylabel('Anomaly Score')
+        axes[3].tick_params(axis='x', rotation=45)
+    
+    plt.tight_layout()
+    plt.savefig('threat_visualizations.png', dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    logger.info("Visualizations saved to threat_visualizations.png")
+
+def generate_report(threats_df, brute_df, anomaly_df, log_df, report_path):
+    """
+    Generate HTML summary report.
+    """
+    total_threats = len(threats_df) + len(brute_df) + len(anomaly_df)
+    
+    html_content = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Threat Hunting Report</title>
+        <style>
+            body {{ font-family: Arial, sans-serif; margin: 40px; }}
+            .header {{ background-color: #f4f4f4; padding: 20px; border-radius: 5px; }}
+            .summary {{ margin: 20px 0; }}
+            .threat-table {{ width: 100%; border-collapse: collapse; margin: 20px 0; }}
+            .threat-table th, .threat-table td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }}
+            .threat-table th {{ background-color: #f2f2f2; }}
+            .high {{ color: #d9534f; font-weight: bold; }}
+            .medium {{ color: #f0ad4e; }}
+            .low {{ color: #5bc0de; }}
+        </style>
+    </head>
+    <body>
+        <div class="header">
+            <h1>Automated Threat Hunting Report</h1>
+            <p>Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+        </div>
+        
+        <div class="summary">
+            <h2>Executive Summary</h2>
+            <p><strong>Total Threats Detected:</strong> {total_threats}</p>
+            <p><strong>SQL Injection/XSS:</strong> {len(threats_df)}</p>
+            <p><strong>Brute Force Attempts:</strong> {len(brute_df)}</p>
+            <p><strong>Anomalous IPs:</strong> {len(anomaly_df)}</p>
+            <p><strong>Total Log Entries Analyzed:</strong> {len(log_df)}</p>
+        </div>
+    """
+    
+    # Add threats table if any
+    if not threats_df.empty:
+        html_content += """
+        <div>
+            <h2>SQL Injection / XSS Threats</h2>
+            <table class="threat-table">
+                <tr>
+                    <th>Timestamp</th><th>IP</th><th>Threat Type</th>
+                    <th>Method</th><th>Path</th><th>Severity</th>
+                </tr>
+        """
+        for _, row in threats_df.head(50).iterrows():  # Limit to 50 rows
+            severity_class = row['severity'].lower()
+            html_content += f"""
+                <tr>
+                    <td>{row['timestamp']}</td>
+                    <td>{row['ip']}</td>
+                    <td>{row['threat_type']}</td>
+                    <td>{row['method']}</td>
+                    <td>{row['path'][:100]}</td>
+                    <td class="{severity_class}">{row['severity']}</td>
+                </tr>
+            """
+        html_content += "</table></div>"
+    
+    # Add brute force table
+    if not brute_df.empty:
+        html_content += """
+        <div>
+            <h2>Brute Force Attempts</h2>
+            <table class="threat-table">
+                <tr>
+                    <th>IP</th><th>Request Count</th><th>Window (min)</th>
+                    <th>First Seen</th><th>Last Seen</th><th>Severity</th>
+                </tr>
+        """
+        for _, row in brute_df.iterrows():
+            html_content += f"""
+                <tr>
+                    <td>{row['ip']}</td>
+                    <td>{row['request_count']}</td>
+                    <td>{row['window_minutes']}</td>
+                    <td>{row['first_seen']}</td>
+                    <td>{row['last_seen']}</td>
+                    <td class="high">{row['severity']}</td>
+                </tr>
+            """
+        html_content += "</table></div>"
+    
+    # Add anomaly table
+    if not anomaly_df.empty:
+        html_content += """
+        <div>
+            <h2>Anomalous IPs</h2>
+            <table class="threat-table">
+                <tr>
+                    <th>IP</th><th>Request Count</th><th>Unique Paths</th>
+                    <th>Error Rate</th><th>Anomaly Score</th><th>Severity</th>
+                </tr>
+        """
+        for _, row in anomaly_df.iterrows():
+            html_content += f"""
+                <tr>
+                    <td>{row['ip']}</td>
+                    <td>{row['request_count']}</td>
+                    <td>{row['unique_paths']}</td>
+                    <td>{row['error_rate']:.2f}</td>
+                    <td>{row['anomaly_score']:.3f}</td>
+                    <td class="medium">{row['severity']}</td>
+                </tr>
+            """
+        html_content += "</table></div>"
+    
+    # Add visualization if exists
+    if os.path.exists('threat_visualizations.png'):
+        html_content += """
+        <div>
+            <h2>Visualizations</h2>
+            <img src="threat_visualizations.png" alt="Threat Visualizations" style="max-width: 100%;">
+        </div>
+        """
+    
+    html_content += """
+        <div style="margin-top: 40px; font-size: 0.9em; color: #777;">
+            <p>Generated by Automated Threat Hunting System v1.0.0</p>
+        </div>
+    </body>
+    </html>
+    """
+    
+    with open(report_path, 'w') as f:
+        f.write(html_content)
+    
+    logger.info(f"Report generated: {report_path}")
+
+def send_email_alert(threats_df, brute_df, anomaly_df, to_email):
+    """
+    Send email alert with threat summary.
+    """
+    if not to_email or not EMAIL_PASSWORD:
+        logger.warning("Email credentials not configured.")
+        return False
+    
+    try:
+        total_threats = len(threats_df) + len(brute_df) + len(anomaly_df)
+        
+        msg = MIMEMultipart('alternative')
+        msg['Subject'] = f'🚨 Threat Alert: {total_threats} Threats Detected'
+        msg['From'] = to_email
+        msg['To'] = to_email
+        
+        # Plain text version
+        text = f"""
+        Threat Hunting Alert
+        
+        Total Threats: {total_threats}
+        SQLi/XSS: {len(threats_df)}
+        Brute Force: {len(brute_df)}
+        Anomalous IPs: {len(anomaly_df)}
+        
+        Check the full report for details.
+        """
+        
+        # HTML version
+        html = f"""
+        <html>
+        <body>
+            <h2>Threat Hunting Alert</h2>
+            <p><strong>Total Threats Detected:</strong> {total_threats}</p>
+            <ul>
+                <li>SQL Injection/XSS: {len(threats_df)}</li>
+                <li>Brute Force Attempts: {len(brute_df)}</li>
+                <li>Anomalous IPs: {len(anomaly_df)}</li>
+            </ul>
+            <p>Check the attached report for full details.</p>
+        </body>
+        </html>
+        """
+        
+        part1 = MIMEText(text, 'plain')
+        part2 = MIMEText(html, 'html')
+        
+        msg.attach(part1)
+        msg.attach(part2)
+        
+        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+            server.starttls()
+            server.login(to_email, EMAIL_PASSWORD)
+            server.send_message(msg)
+        
+        logger.info(f"Email alert sent to {to_email}")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to send email alert: {e}")
+        return False
+
+def send_slack_alert(threats_df, brute_df, anomaly_df, webhook_url):
+    """
+    Send Slack alert via webhook.
+    """
+    if not webhook_url:
+        logger.warning("Slack webhook not configured.")
+        return False
+    
+    try:
+        total_threats = len(threats_df) + len(brute_df) + len(anomaly_df)
+        
+        # Create a formatted message
+        message = {
+            "blocks": [
+                {
+                    "type": "header",
+                    "text": {
+                        "type": "plain_text",
+                        "text": "🚨 Threat Hunting Alert"
+                    }
+                },
+                {
+                    "type": "section",
+                    "fields": [
+                        {
+                            "type": "mrkdwn",
+                            "text": f"*Total Threats:*\n{total_threats}"
+                        },
+                        {
+                            "type": "mrkdwn",
+                            "text": f"*SQLi/XSS:*\n{len(threats_df)}"
+                        }
+                    ]
+                },
+                {
+                    "type": "section",
+                    "fields": [
+                        {
+                            "type": "mrkdwn",
+                            "text": f"*Brute Force:*\n{len(brute_df)}"
+                        },
+                        {
+                            "type": "mrkdwn",
+                            "text": f"*Anomalous IPs:*\n{len(anomaly_df)}"
+                        }
+                    ]
+                },
+                {
+                    "type": "divider"
+                },
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"Report generated at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                    }
+                }
+            ]
+        }
+        
+        response = requests.post(
+            webhook_url,
+            data=json.dumps(message),
+            headers={'Content-Type': 'application/json'}
+        )
+        
+        if response.status_code == 200:
+            logger.info("Slack alert sent successfully.")
+            return True
+        else:
+            logger.error(f"Slack API error: {response.status_code}")
+            return False
+    except Exception as e:
+        logger.error(f"Failed to send Slack alert: {e}")
+        return False
+
+def main():
+    """Main execution function."""
+    parser = argparse.ArgumentParser(description='Automated Log Analysis & Threat Hunting')
+    parser.add_argument('--log-file', default=LOG_FILE_PATH, help='Path to log file')
+    parser.add_argument('--no-email', action='store_true', help='Disable email alerts')
+    parser.add_argument('--no-slack', action='store_true', help='Disable Slack alerts')
+    parser.add_argument('--verbose', action='store_true', help='Enable verbose logging')
+    args = parser.parse_args()
+    
+    if args.verbose:
+        logger.setLevel(logging.DEBUG)
+    
+    logger.info("Starting threat hunting analysis...")
+    
+    try:
+        # Step 1: Parse logs
+        log_df = parse_logs(args.log_file)
+        if log_df.empty:
+            logger.warning("No log data to analyze.")
+            return
+        
+        # Step 2: Detect threats
+        logger.info("Detecting SQL injection and XSS...")
+        threats_df = detect_sqli_xss(log_df)
+        
+        logger.info("Detecting brute force attempts...")
+        brute_df = detect_bruteforce(log_df)
+        
+        logger.info("Detecting anomalous IPs...")
+        anomaly_df = detect_anomalous_ips(log_df)
+        
+        # Step 3: Generate report and visualizations
+        logger.info("Generating visualizations...")
+        generate_visualizations(threats_df, brute_df, anomaly_df, REPORT_PATH)
+        
+        logger.info("Generating HTML report...")
+        generate_report(threats_df, brute_df, anomaly_df, log_df, REPORT_PATH)
+        
+        # Step 4: Send alerts if threats detected
+        total_threats = len(threats_df) + len(brute_df) + len(anomaly_df)
+        
+        if total_threats > 0:
+            logger.warning(f"ALERT: {total_threats} threats detected!")
+            
+            # Email alert
+            if not args.no_email and ALERT_EMAIL:
+                send_email_alert(threats_df, brute_df, anomaly_df, ALERT_EMAIL)
+            
+            # Slack alert
+            if not args.no_slack and SLACK_WEBHOOK_URL:
+                send_slack_alert(threats_df, brute_df, anomaly_df, SLACK_WEBHOOK_URL)
+        
+        # Step 5: Print summary to console
+        print("\n" + "="*60)
+        print("THREAT HUNTING SUMMARY")
+        print("="*60)
+        print(f"Log entries analyzed: {len(log_df)}")
+        print(f"SQL Injection/XSS threats: {len(threats_df)}")
+        print(f"Brute force attempts: {len(brute_df)}")
+        print(f"Anomalous IPs: {len(anomaly_df)}")
+        print(f"Total threats: {total_threats}")
+        print(f"Report saved: {REPORT_PATH}")
+        
+        if not threats_df.empty:
+            print("\nTop threat IPs:")
+            for ip, count in threats_df['ip'].value_counts().head(5).items():
+                print(f"  {ip}: {count} threats")
+        
+        if total_threats == 0:
+            print("\n✅ No threats detected. System appears secure.")
+        else:
+            print("\n⚠️  Threats detected! Review the report for details.")
+        
+        logger.info("Threat hunting analysis completed.")
+        
+    except Exception as e:
+        logger.error(f"Analysis failed: {e}", exc_info=True)
+        raise
+
+if __name__ == "__main__":
+    main()
